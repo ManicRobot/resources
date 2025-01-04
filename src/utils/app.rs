@@ -12,7 +12,7 @@ use gtk::{
 };
 use lazy_regex::{lazy_regex, Lazy, Regex};
 use log::{debug, info, trace};
-use process_data::{Containerization, GpuIdentifier, ProcessData};
+use process_data::{pci_slot::PciSlot, Containerization, GpuIdentifier, ProcessData};
 
 use crate::i18n::i18n;
 
@@ -640,6 +640,52 @@ impl AppsContext {
             .clamp(0.0, 1.0)
     }
 
+    pub fn npu_fraction(&self, pci_slot: PciSlot) -> f32 {
+        self.processes_iter()
+            .map(|process| {
+                (
+                    &process.data.npu_usage_stats,
+                    &process.npu_usage_stats_last,
+                    process.data.timestamp,
+                    process.timestamp_last,
+                )
+            })
+            .map(|(new, old, timestamp, timestamp_last)| {
+                (
+                    new.get(&pci_slot),
+                    old.get(&pci_slot),
+                    timestamp,
+                    timestamp_last,
+                )
+            })
+            .filter_map(|(new, old, timestamp, timestamp_last)| match (new, old) {
+                (Some(new), Some(old)) => Some((new, old, timestamp, timestamp_last)),
+                _ => None,
+            })
+            .map(|(new, old, timestamp, timestamp_last)| {
+                if old.usage == 0 {
+                    0.0
+                } else {
+                    ((new.usage.saturating_sub(old.usage) as f32)
+                        / (timestamp.saturating_sub(timestamp_last) as f32))
+                        .finite_or_default()
+                        / 1_000_000.0
+                }
+            })
+            .sum::<f32>()
+            .clamp(0.0, 1.0)
+    }
+
+    pub fn npu_mem(&self, pci_slot: PciSlot) -> u64 {
+        self.processes_iter()
+            .map(|process| process.data.npu_usage_stats.get(&pci_slot))
+            .map(|stats| match stats {
+                Some(stats) => stats.mem,
+                None => 0,
+            })
+            .sum()
+    }
+
     fn app_associated_with_process(&self, process: &Process) -> Option<String> {
         // TODO: tidy this up
         // ↓ look for whether we can find an ID in the cgroup
@@ -797,6 +843,7 @@ impl AppsContext {
                 old_process.read_bytes_last = old_process.data.read_bytes;
                 old_process.write_bytes_last = old_process.data.write_bytes;
                 old_process.gpu_usage_stats_last = old_process.data.gpu_usage_stats.clone();
+                old_process.npu_usage_stats_last = old_process.data.npu_usage_stats.clone();
 
                 old_process.data = process_data.clone();
             } else {

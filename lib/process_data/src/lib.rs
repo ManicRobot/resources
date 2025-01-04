@@ -3,6 +3,7 @@ pub mod pci_slot;
 use anyhow::{bail, Context, Result};
 use glob::glob;
 use lazy_regex::{lazy_regex, Lazy, Regex};
+use log::{debug, trace, warn};
 use nutype::nutype;
 use nvml_wrapper::enums::device::UsedGpuMemory;
 use nvml_wrapper::error::NvmlError;
@@ -12,8 +13,6 @@ use pci_slot::PciSlot;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Display;
-use std::fs::File;
-use std::io::{Read, Write};
 use std::os::linux::fs::MetadataExt;
 use std::path::Path;
 use std::str::FromStr;
@@ -27,10 +26,21 @@ const STAT_SYSTEM_CPU_TIME: usize = 14 - STAT_OFFSET;
 const STAT_NICE: usize = 18 - STAT_OFFSET;
 const STAT_STARTTIME: usize = 21 - STAT_OFFSET;
 
+const GPU_DRIVER_NAMES: &[&str] = &["amdgpu", "i915"];
+const NPU_DRIVER_NAMES: &[&str] = &["amdxdna_accel_driver"];
+
+const MAJOR: u32 = 226;
+
 static USERS_CACHE: LazyLock<HashMap<libc::uid_t, String>> = LazyLock::new(|| unsafe {
-    uzers::all_users()
-        .map(|user| (user.uid(), user.name().to_string_lossy().to_string()))
-        .collect()
+    debug!("Initializing users cache…");
+    let users: HashMap<libc::uid_t, String> = uzers::all_users()
+        .map(|user| {
+            trace!("Found user {}", user.name().to_string_lossy());
+            (user.uid(), user.name().to_string_lossy().to_string())
+        })
+        .collect();
+    debug!("Found {} users", users.len());
+    users
 });
 
 static PAGESIZE: LazyLock<usize> = LazyLock::new(sysconf::pagesize);
@@ -51,6 +61,10 @@ static RE_DRM_DRIVER: Lazy<Regex> = lazy_regex!(r"drm-driver:\s*(.+)");
 
 static RE_DRM_PDEV: Lazy<Regex> =
     lazy_regex!(r"drm-pdev:\s*([0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f])");
+
+// AMD only
+static RE_DRM_ENGINE_NPU_AMDXDNA: Lazy<Regex> =
+    lazy_regex!(r"drm-engine-npu-amdxdna:\s*(\d+)\s*ns");
 
 // AMD only
 static RE_DRM_ENGINE_GFX: Lazy<Regex> = lazy_regex!(r"drm-engine-gfx:\s*(\d+)\s*ns");
@@ -76,19 +90,27 @@ static RE_DRM_ENGINE_RENDER: Lazy<Regex> = lazy_regex!(r"drm-engine-render:\s*(\
 // Intel only
 static RE_DRM_ENGINE_VIDEO: Lazy<Regex> = lazy_regex!(r"drm-engine-video:\s*(\d+)\s*ns");
 
-// v3d only
 static RE_DRM_TOTAL_MEMORY: Lazy<Regex> = lazy_regex!(r"drm-total-memory:\s*(\d+)\s*KiB");
 
-static NVML: Lazy<Result<Nvml, NvmlError>> = Lazy::new(Nvml::init);
+static NVML: Lazy<Result<Nvml, NvmlError>> = Lazy::new(|| {
+    debug!("Initializing connection to NVML…");
+    Nvml::init().inspect_err(|err| warn!("Unable to connect to NVML: {err}"))
+});
 
 static NVML_DEVICES: Lazy<Vec<(PciSlot, Device)>> = Lazy::new(|| {
     if let Ok(nvml) = NVML.as_ref() {
+        debug!("Looking for NVIDIA devices…");
         let device_count = nvml.device_count().unwrap_or(0);
         let mut return_vec = Vec::with_capacity(device_count as usize);
         for i in 0..device_count {
             if let Ok(gpu) = nvml.device_by_index(i) {
                 if let Ok(pci_slot) = gpu.pci_info().map(|pci_info| pci_info.bus_id) {
                     let pci_slot = PciSlot::from_str(&pci_slot).unwrap();
+                    debug!(
+                        "Found {} at {}",
+                        gpu.name().unwrap_or("N/A".into()),
+                        pci_slot
+                    );
                     return_vec.push((pci_slot, gpu));
                 }
             }
@@ -160,6 +182,13 @@ pub struct GpuUsageStats {
     pub nvidia: bool,
 }
 
+/// Represents NPU usage statistics per-process.
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize, Copy)]
+pub struct NpuUsageStats {
+    pub usage: u64,
+    pub mem: u64,
+}
+
 /// Data that could be transferred using `resources-processes`, separated from
 /// `Process` mainly due to `Icon` not being able to derive `Serialize` and
 /// `Deserialize`.
@@ -184,6 +213,7 @@ pub struct ProcessData {
     pub timestamp: u64,
     /// Key: PCI Slot ID of the GPU
     pub gpu_usage_stats: BTreeMap<GpuIdentifier, GpuUsageStats>,
+    pub npu_usage_stats: BTreeMap<PciSlot, NpuUsageStats>,
 }
 
 impl ProcessData {
@@ -263,19 +293,29 @@ impl ProcessData {
 
     pub fn try_from_path<P: AsRef<Path>>(proc_path: P) -> Result<Self> {
         let proc_path = proc_path.as_ref();
-        let stat = std::fs::read_to_string(proc_path.join("stat"))?;
-        let statm = std::fs::read_to_string(proc_path.join("statm"))?;
-        let status = std::fs::read_to_string(proc_path.join("status"))?;
-        let comm = std::fs::read_to_string(proc_path.join("comm"))?;
-        let commandline = std::fs::read_to_string(proc_path.join("cmdline"))?;
-        let io = std::fs::read_to_string(proc_path.join("io")).ok();
-
         let pid = proc_path
             .file_name()
             .context("proc_path terminates in ..")?
             .to_str()
             .context("can't turn OsStr to str")?
             .parse()?;
+
+        trace!("Inspecting process {pid}…");
+
+        trace!("Reading info files…");
+        let stat = std::fs::read_to_string(proc_path.join("stat"))
+            .inspect_err(|err| trace!("Error reading 'stat': {err}"))?;
+        let statm = std::fs::read_to_string(proc_path.join("statm"))
+            .inspect_err(|err| trace!("Error reading 'statm': {err}"))?;
+        let status = std::fs::read_to_string(proc_path.join("status"))
+            .inspect_err(|err| trace!("Error reading 'status': {err}"))?;
+        let comm = std::fs::read_to_string(proc_path.join("comm"))
+            .inspect_err(|err| trace!("Error reading 'comm': {err}"))?;
+        let commandline = std::fs::read_to_string(proc_path.join("cmdline"))
+            .inspect_err(|err| trace!("Error reading 'cmdline': {err}"))?;
+        let io = std::fs::read_to_string(proc_path.join("io"))
+            .inspect_err(|err| trace!("Error reading 'io': {err}"))
+            .ok();
 
         let user = USERS_CACHE
             .get(&Self::get_uid(proc_path)?)
@@ -285,7 +325,8 @@ impl ProcessData {
         let stat = stat
             .split(')') // since we don't care about the pid or the executable name, split after the executable name to make our life easier
             .last()
-            .context("stat doesn't have ')'")?
+            .context("stat doesn't have ')'")
+            .inspect_err(|err| trace!("Can't parse 'stat': {err}"))?
             .split(' ')
             .skip(1) // the first element would be a space, let's ignore that
             .collect::<Vec<_>>();
@@ -298,23 +339,28 @@ impl ProcessData {
         let parent_pid = stat
             .get(STAT_PARENT_PID)
             .context("wrong stat file format")
-            .and_then(|x| x.parse().context("couldn't parse stat file content"))?;
+            .and_then(|x| x.parse().context("couldn't parse stat file content to int"))
+            .inspect_err(|err| trace!("Can't parse parent pid from 'stat': {err}"))?;
         let user_cpu_time = stat
             .get(STAT_USER_CPU_TIME)
             .context("wrong stat file format")
-            .and_then(|x| x.parse().context("couldn't parse stat file content"))?;
+            .and_then(|x| x.parse().context("couldn't parse stat file content to int"))
+            .inspect_err(|err| trace!("Can't parse user cpu time from 'stat': {err}"))?;
         let system_cpu_time = stat
             .get(STAT_SYSTEM_CPU_TIME)
             .context("wrong stat file format")
-            .and_then(|x| x.parse().context("couldn't parse stat file content"))?;
+            .and_then(|x| x.parse().context("couldn't parse stat file content to int"))
+            .inspect_err(|err| trace!("Can't parse system cpu time from 'stat': {err}"))?;
         let nice = stat
             .get(STAT_NICE)
             .context("wrong stat file format")
-            .and_then(|x| x.parse().context("couldn't parse stat file content"))?;
+            .and_then(|x| x.parse().context("couldn't parse stat file content to int"))
+            .inspect_err(|err| trace!("Can't parse nice from 'stat': {err}"))?;
         let starttime = stat
             .get(STAT_STARTTIME)
             .context("wrong stat file format")
-            .and_then(|x| x.parse().context("couldn't parse stat file content"))?;
+            .and_then(|x| x.parse().context("couldn't parse stat file content to int"))
+            .inspect_err(|err| trace!("Can't parse start time from 'stat': {err}"))?;
 
         let mut affinity = Vec::with_capacity(*NUM_CPUS);
         RE_AFFINITY
@@ -350,7 +396,8 @@ impl ProcessData {
             .and_then(|x| {
                 x.parse::<usize>()
                     .context("couldn't parse statm file content")
-            })?
+            })
+            .inspect_err(|err| trace!("Can't parse memory usage from 'statm': {err}"))?
             .saturating_sub(
                 statm
                     .get(2)
@@ -363,6 +410,7 @@ impl ProcessData {
             .saturating_mul(*PAGESIZE);
 
         let cgroup = std::fs::read_to_string(proc_path.join("cgroup"))
+            .inspect_err(|err| trace!("Can't read cgroup: {err}"))
             .ok()
             .and_then(Self::sanitize_cgroup);
 
@@ -390,6 +438,8 @@ impl ProcessData {
 
         let gpu_usage_stats = Self::gpu_usage_stats(proc_path, pid);
 
+        let npu_usage_stats = Self::npu_usage_stats(proc_path, pid).unwrap_or_default();
+
         let timestamp = unix_as_millis();
 
         Ok(Self {
@@ -411,10 +461,91 @@ impl ProcessData {
             write_bytes,
             timestamp,
             gpu_usage_stats,
+            npu_usage_stats,
         })
     }
 
+    /// Returns the fd_num and the plausibility of whether this file might contain drm fdinfo data.
+    /// This function is cautious and will signal plausibility if there's an error during evaluation.
+    fn drm_fdinfo_plausible<P: AsRef<Path>>(
+        fdinfo_path: P,
+        pid: libc::pid_t,
+        seen_fds: &HashSet<usize>,
+    ) -> (bool, usize) {
+        let fdinfo_path = fdinfo_path.as_ref();
+
+        // if our fd is 0, 1 or 2 it's probably just a std stream so skip it
+        let fd_num = fdinfo_path
+            .file_name()
+            .and_then(|osstr| osstr.to_str())
+            .unwrap_or("0")
+            .parse::<usize>()
+            .unwrap_or(0);
+        if fd_num <= 2 {
+            trace!(
+                "fdinfo {fd_num} deemed as not plausible. Reason: fd_num ≤ 2 (probably std stream)"
+            );
+            return (false, fd_num);
+        }
+
+        let _file = std::fs::File::open(&fdinfo_path);
+        if _file.is_err() {
+            trace!("fdinfo {fd_num} deemed as not plausible. Reason: File can't be opened");
+            return (false, fd_num);
+        }
+        let file = _file.unwrap();
+
+        let _metadata = file.metadata();
+        if _metadata.is_err() {
+            trace!(
+                "fdinfo {fd_num} deemed as not plausible. Reason: File's metadata can't be read"
+            );
+            return (false, fd_num);
+        }
+        let metadata = _metadata.unwrap();
+
+        if !metadata.is_file() {
+            trace!("fdinfo {fd_num} deemed as not plausible. Reason: Not a file");
+            return (false, fd_num);
+        }
+
+        // Adapted from nvtop's `is_drm_fd()`
+        // https://github.com/Syllo/nvtop/blob/master/src/extract_processinfo_fdinfo.c
+        let fd_path = fdinfo_path.to_str().map(|s| s.replace("fdinfo", "fd"));
+        if let Some(fd_path) = fd_path {
+            if let Ok(fd_metadata) = std::fs::metadata(fd_path) {
+                if (fd_metadata.st_mode() & libc::S_IFMT) != libc::S_IFCHR {
+                    trace!("fdinfo {fd_num} deemed as not plausible. Reason: Wrong st_mode");
+                    return (false, fd_num);
+                }
+                let major = unsafe { libc::major(fd_metadata.st_rdev()) };
+                if major != MAJOR {
+                    trace!(
+                        "fdinfo {fd_num} deemed as not plausible. Reason: Wrong major (expected: {MAJOR}, got: {major})"
+                    );
+                    return (false, fd_num);
+                }
+            }
+        }
+
+        // Adapted from nvtop's `processinfo_sweep_fdinfos()`
+        // https://github.com/Syllo/nvtop/blob/master/src/extract_processinfo_fdinfo.c
+        // if we've already seen the file this fd refers to, skip
+        let not_unique = seen_fds.iter().any(|seen_fd| unsafe {
+            syscalls::syscall!(syscalls::Sysno::kcmp, pid, pid, 0, fd_num, *seen_fd).unwrap_or(0)
+                == 0
+        });
+        if not_unique {
+            trace!("fdinfo {fd_num} deemed as not plausible. Reason: kcmp indicated that we've already seen this file");
+            return (false, fd_num);
+        }
+
+        trace!("fdinfo {fd_num} deemed as plausible");
+        (true, fd_num)
+    }
+
     fn gpu_usage_stats(proc_path: &Path, pid: i32) -> BTreeMap<GpuIdentifier, GpuUsageStats> {
+        trace!("Gathering GPU stats…");
         let nvidia_stats = Self::nvidia_gpu_stats_all(pid);
         let mut other_stats = Self::other_gpu_usage_stats(proc_path, pid).unwrap_or_default();
         other_stats.extend(nvidia_stats);
@@ -430,180 +561,220 @@ impl ProcessData {
         let mut seen_fds = HashSet::new();
 
         let mut return_map = BTreeMap::new();
-        for entry in std::fs::read_dir(fdinfo_dir)? {
-            let entry = entry?;
+        for entry in std::fs::read_dir(fdinfo_dir)?.flatten() {
             let fdinfo_path = entry.path();
 
-            let _file = std::fs::File::open(&fdinfo_path);
-            if _file.is_err() {
-                continue;
-            }
-            let mut file = _file.unwrap();
-
-            let _metadata = file.metadata();
-            if _metadata.is_err() {
-                continue;
-            }
-            let metadata = _metadata.unwrap();
-
-            // if our fd is 0, 1 or 2 it's probably just a std stream so skip it
-            let fd_num = fdinfo_path
-                .file_name()
-                .and_then(|osstr| osstr.to_str())
-                .unwrap_or("0")
-                .parse::<usize>()
-                .unwrap_or(0);
-            if fd_num <= 2 {
-                continue;
-            }
-
-            if !metadata.is_file() {
-                continue;
-            }
-
-            // Adapted from nvtop's `is_drm_fd()`
-            // https://github.com/Syllo/nvtop/blob/master/src/extract_processinfo_fdinfo.c
-            let fd_path = fdinfo_path.to_str().map(|s| s.replace("fdinfo", "fd"));
-            if let Some(fd_path) = fd_path {
-                if let Ok(fd_metadata) = std::fs::metadata(fd_path) {
-                    let major = unsafe { libc::major(fd_metadata.st_rdev()) };
-                    if (fd_metadata.st_mode() & libc::S_IFMT) != libc::S_IFCHR || major != 226 {
-                        continue;
-                    }
-                }
-            }
-
-            // Adapted from nvtop's `processinfo_sweep_fdinfos()`
-            // https://github.com/Syllo/nvtop/blob/master/src/extract_processinfo_fdinfo.c
-            // if we've already seen the file this fd refers to, skip
-            let not_unique = seen_fds.iter().any(|seen_fd| unsafe {
-                syscalls::syscall!(syscalls::Sysno::kcmp, pid, pid, 0, fd_num, *seen_fd)
-                    .unwrap_or(0)
-                    == 0
-            });
-            if not_unique {
+            let (plausible, fd_num) = Self::drm_fdinfo_plausible(&fdinfo_path, pid, &seen_fds);
+            if !plausible {
                 continue;
             }
 
             seen_fds.insert(fd_num);
 
-            if let Ok(stats) = Self::read_fdinfo(&mut file, metadata.len() as usize) {
+            if let Ok((pci_slot, stats)) = Self::read_gpu_fdinfo(&fdinfo_path) {
                 return_map
-                    .entry(stats.0)
+                    .entry(pci_slot)
                     .and_modify(|existing_value: &mut GpuUsageStats| {
-                        if stats.1.gfx > existing_value.gfx {
-                            existing_value.gfx = stats.1.gfx;
+                        if stats.gfx > existing_value.gfx {
+                            existing_value.gfx = stats.gfx;
                         }
-                        if stats.1.dec > existing_value.dec {
-                            existing_value.dec = stats.1.dec;
+                        if stats.dec > existing_value.dec {
+                            existing_value.dec = stats.dec;
                         }
-                        if stats.1.enc > existing_value.enc {
-                            existing_value.enc = stats.1.enc;
+                        if stats.enc > existing_value.enc {
+                            existing_value.enc = stats.enc;
                         }
-                        if stats.1.mem > existing_value.mem {
-                            existing_value.mem = stats.1.mem;
+                        if stats.mem > existing_value.mem {
+                            existing_value.mem = stats.mem;
                         }
                     })
-                    .or_insert(stats.1);
+                    .or_insert(stats);
             }
         }
 
         Ok(return_map)
     }
 
-    fn read_fdinfo(
-        fdinfo_file: &mut File,
-        file_size: usize,
-    ) -> Result<(GpuIdentifier, GpuUsageStats)> {
-        let mut content = String::with_capacity(file_size);
-        fdinfo_file.read_to_string(&mut content)?;
-        fdinfo_file.flush()?;
+    fn npu_usage_stats(proc_path: &Path, pid: i32) -> Result<BTreeMap<PciSlot, NpuUsageStats>> {
+        trace!("Gathering NPU stats…");
+        let fdinfo_dir = proc_path.join("fdinfo");
+
+        let mut seen_fds = HashSet::new();
+
+        let mut return_map = BTreeMap::new();
+        for entry in std::fs::read_dir(fdinfo_dir)?.flatten() {
+            let fdinfo_path = entry.path();
+
+            let (plausible, fd_num) = Self::drm_fdinfo_plausible(&fdinfo_path, pid, &seen_fds);
+            if !plausible {
+                continue;
+            }
+
+            seen_fds.insert(fd_num);
+
+            if let Ok((pci_slot, stats)) = Self::read_npu_fdinfo(&fdinfo_path) {
+                return_map
+                    .entry(pci_slot)
+                    .and_modify(|existing_value: &mut NpuUsageStats| {
+                        if stats.usage > existing_value.usage {
+                            existing_value.usage = stats.usage;
+                        }
+                        if stats.mem > existing_value.mem {
+                            existing_value.mem = stats.mem;
+                        }
+                    })
+                    .or_insert(stats);
+            }
+        }
+
+        Ok(return_map)
+    }
+
+    fn read_npu_fdinfo<P: AsRef<Path>>(fdinfo_path: P) -> Result<(PciSlot, NpuUsageStats)> {
+        trace!(
+            "Reading and parsing {} for NPU stats…",
+            fdinfo_path.as_ref().to_string_lossy()
+        );
+
+        let content = std::fs::read_to_string(fdinfo_path.as_ref())?;
+
+        let pci_slot = RE_DRM_PDEV
+            .captures(&content)
+            .and_then(|captures| captures.get(1))
+            .and_then(|capture| PciSlot::from_str(capture.as_str()).ok())
+            .context("can't parse PCI slot ID")?;
 
         let driver = RE_DRM_DRIVER
             .captures(&content)
             .and_then(|captures| captures.get(1))
-            .map(|capture| capture.as_str());
+            .map(|capture| capture.as_str())
+            .unwrap_or_default();
 
-        if driver.is_some() {
-            let gpu_identifier = RE_DRM_PDEV
-                .captures(&content)
-                .and_then(|captures| captures.get(1))
-                .and_then(|capture| PciSlot::from_str(capture.as_str()).ok())
-                .map(|pci_slot| GpuIdentifier::PciSlot(pci_slot))
-                .unwrap_or_default();
-
-            let gfx = RE_DRM_ENGINE_GFX
-                .captures(&content)
-                .and_then(|captures| captures.get(1))
-                .and_then(|capture| capture.as_str().parse::<u64>().ok())
-                .unwrap_or_default();
-
-            let render = RE_DRM_ENGINE_RENDER
-                .captures(&content)
-                .and_then(|captures| captures.get(1))
-                .and_then(|capture| capture.as_str().parse::<u64>().ok())
-                .unwrap_or_default();
-
-            let compute = RE_DRM_ENGINE_COMPUTE
-                .captures(&content)
-                .and_then(|captures| captures.get(1))
-                .and_then(|capture| capture.as_str().parse::<u64>().ok())
-                .unwrap_or_default();
-
-            let enc = RE_DRM_ENGINE_ENC
-                .captures(&content)
-                .and_then(|captures| captures.get(1))
-                .and_then(|capture| capture.as_str().parse::<u64>().ok())
-                .unwrap_or_default();
-
-            let video = RE_DRM_ENGINE_VIDEO
-                .captures(&content)
-                .and_then(|captures| captures.get(1))
-                .and_then(|capture| capture.as_str().parse::<u64>().ok())
-                .unwrap_or_default();
-
-            let dec = RE_DRM_ENGINE_DEC
-                .captures(&content)
-                .and_then(|captures| captures.get(1))
-                .and_then(|capture| capture.as_str().parse::<u64>().ok())
-                .unwrap_or_default();
-
-            let vram = RE_DRM_MEMORY_VRAM
-                .captures(&content)
-                .and_then(|captures| captures.get(1))
-                .and_then(|capture| capture.as_str().parse::<u64>().ok())
-                .unwrap_or_default()
-                .saturating_mul(1024);
-
-            let gtt = RE_DRM_MEMORY_GTT
-                .captures(&content)
-                .and_then(|captures| captures.get(1))
-                .and_then(|capture| capture.as_str().parse::<u64>().ok())
-                .unwrap_or_default()
-                .saturating_mul(1024);
-
-            let total_memory = RE_DRM_TOTAL_MEMORY
-                .captures(&content)
-                .and_then(|captures| captures.get(1))
-                .and_then(|capture| capture.as_str().parse::<u64>().ok())
-                .unwrap_or_default()
-                .saturating_mul(1024);
-
-            let stats = GpuUsageStats {
-                gfx: gfx.saturating_add(render).saturating_add(compute),
-                mem: vram.saturating_add(gtt).saturating_add(total_memory),
-                enc: enc.saturating_add(video),
-                dec,
-                nvidia: false,
-            };
-
-            return Ok((gpu_identifier, stats));
+        if !NPU_DRIVER_NAMES.contains(&driver) {
+            trace!("Driver '{driver}' is not known to be NPU-related, skipping");
+            bail!("this is not an NPU")
         }
 
-        bail!("unable to find gpu information in this fdinfo");
+        let usage = RE_DRM_ENGINE_NPU_AMDXDNA
+            .captures(&content)
+            .and_then(|captures| captures.get(1))
+            .and_then(|capture| capture.as_str().parse::<u64>().ok())
+            .unwrap_or_default();
+
+        let total_memory = RE_DRM_TOTAL_MEMORY
+            .captures(&content)
+            .and_then(|captures| captures.get(1))
+            .and_then(|capture| capture.as_str().parse::<u64>().ok())
+            .unwrap_or_default()
+            .saturating_mul(1024);
+
+        let stats = NpuUsageStats {
+            usage,
+            mem: total_memory,
+        };
+
+        trace!("Success reading NPU data for {pci_slot}: {stats:?}");
+
+        return Ok((pci_slot, stats));
+    }
+
+    fn read_gpu_fdinfo<P: AsRef<Path>>(fdinfo_path: P) -> Result<(GpuIdentifier, GpuUsageStats)> {
+        trace!(
+            "Reading and parsing {} for GPU stats…",
+            fdinfo_path.as_ref().to_string_lossy()
+        );
+
+        let content = std::fs::read_to_string(fdinfo_path.as_ref())?;
+
+        let driver = RE_DRM_DRIVER
+            .captures(&content)
+            .and_then(|captures| captures.get(1))
+            .map(|capture| capture.as_str())
+            .unwrap_or_default();
+
+        if !GPU_DRIVER_NAMES.contains(&driver) {
+            trace!("Driver {driver} is not known to be GPU-related, skipping");
+            bail!("this is not a GPU");
+        }
+
+        let gpu_identifier = RE_DRM_PDEV
+            .captures(&content)
+            .and_then(|captures| captures.get(1))
+            .and_then(|capture| PciSlot::from_str(capture.as_str()).ok())
+            .map(|pci_slot| GpuIdentifier::PciSlot(pci_slot))
+            .unwrap_or_default();
+
+        let gfx = RE_DRM_ENGINE_GFX
+            .captures(&content)
+            .and_then(|captures| captures.get(1))
+            .and_then(|capture| capture.as_str().parse::<u64>().ok())
+            .unwrap_or_default();
+
+        let render = RE_DRM_ENGINE_RENDER
+            .captures(&content)
+            .and_then(|captures| captures.get(1))
+            .and_then(|capture| capture.as_str().parse::<u64>().ok())
+            .unwrap_or_default();
+
+        let compute = RE_DRM_ENGINE_COMPUTE
+            .captures(&content)
+            .and_then(|captures| captures.get(1))
+            .and_then(|capture| capture.as_str().parse::<u64>().ok())
+            .unwrap_or_default();
+
+        let enc = RE_DRM_ENGINE_ENC
+            .captures(&content)
+            .and_then(|captures| captures.get(1))
+            .and_then(|capture| capture.as_str().parse::<u64>().ok())
+            .unwrap_or_default();
+
+        let video = RE_DRM_ENGINE_VIDEO
+            .captures(&content)
+            .and_then(|captures| captures.get(1))
+            .and_then(|capture| capture.as_str().parse::<u64>().ok())
+            .unwrap_or_default();
+
+        let dec = RE_DRM_ENGINE_DEC
+            .captures(&content)
+            .and_then(|captures| captures.get(1))
+            .and_then(|capture| capture.as_str().parse::<u64>().ok())
+            .unwrap_or_default();
+
+        let vram = RE_DRM_MEMORY_VRAM
+            .captures(&content)
+            .and_then(|captures| captures.get(1))
+            .and_then(|capture| capture.as_str().parse::<u64>().ok())
+            .unwrap_or_default()
+            .saturating_mul(1024);
+
+        let gtt = RE_DRM_MEMORY_GTT
+            .captures(&content)
+            .and_then(|captures| captures.get(1))
+            .and_then(|capture| capture.as_str().parse::<u64>().ok())
+            .unwrap_or_default()
+            .saturating_mul(1024);
+
+        let total_memory = RE_DRM_TOTAL_MEMORY
+            .captures(&content)
+            .and_then(|captures| captures.get(1))
+            .and_then(|capture| capture.as_str().parse::<u64>().ok())
+            .unwrap_or_default()
+            .saturating_mul(1024);
+
+        let stats = GpuUsageStats {
+            gfx: gfx.saturating_add(render).saturating_add(compute),
+            mem: vram.saturating_add(gtt).saturating_add(total_memory),
+            enc: enc.saturating_add(video),
+            dec,
+            nvidia: false,
+        };
+
+        return Ok((gpu_identifier, stats));
     }
 
     fn nvidia_gpu_stats_all(pid: i32) -> BTreeMap<GpuIdentifier, GpuUsageStats> {
+        trace!("Gathering NVIDIA GPU stats…");
+
         let mut return_map = BTreeMap::new();
 
         for (pci_slot, _) in NVML_DEVICES.iter() {
@@ -616,6 +787,7 @@ impl ProcessData {
     }
 
     fn nvidia_gpu_stats(pid: i32, pci_slot: PciSlot) -> Result<GpuUsageStats> {
+        trace!("Gathering GPU stats for NVIDIA GPU at {pci_slot}…");
         let this_process_stats = NVIDIA_PROCESSES_STATS
             .read()
             .unwrap()
@@ -650,6 +822,7 @@ impl ProcessData {
     }
 
     fn nvidia_process_infos() -> HashMap<PciSlot, Vec<ProcessInfo>> {
+        trace!("Refreshing NVIDIA process infos…");
         let mut return_map = HashMap::new();
 
         for (pci_slot, gpu) in NVML_DEVICES.iter() {
@@ -663,6 +836,7 @@ impl ProcessData {
     }
 
     fn nvidia_process_stats() -> HashMap<PciSlot, Vec<ProcessUtilizationSample>> {
+        trace!("Refreshing NVIDIA process stats…");
         let mut return_map = HashMap::new();
 
         for (pci_slot, gpu) in NVML_DEVICES.iter() {

@@ -10,20 +10,16 @@ use process_data::GpuIdentifier;
 use std::{path::PathBuf, sync::LazyLock};
 
 static NVML: LazyLock<Result<Nvml, NvmlError>> = LazyLock::new(|| {
-    let nvml = Nvml::init();
-
-    if let Err(error) = nvml.as_ref() {
-        warn!("Connection to NVML failed, reason: {error}");
-        if *IS_FLATPAK {
-            warn!("This can occur when the version of the NVIDIA Flatpak runtime (org.freedesktop.Platform.GL.nvidia) \
-            and the version of the natively installed NVIDIA driver do not match. Consider updating both your system \
-            and Flatpak packages before opening an issue.")
-        }
-    } else {
-        debug!("Successfully connected to NVML");
-    }
-
-    nvml
+    Nvml::init()
+        .inspect_err(|err| {
+            warn!("Unable to connect to NVML: {err}"); 
+            if *IS_FLATPAK {
+                warn!("This can occur when the version of the NVIDIA Flatpak runtime \
+                (org.freedesktop.Platform.GL.nvidia) and the version of the natively installed NVIDIA driver do not \
+                match. Consider updating both your system and Flatpak packages before opening an issue.");
+            }
+        })
+        .inspect(|_| debug!("Successfully connected to NVML"))
 });
 
 use crate::utils::{pci::Device, IS_FLATPAK};

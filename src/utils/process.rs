@@ -1,7 +1,9 @@
 use anyhow::{bail, Context, Result};
 use config::LIBEXECDIR;
 use log::{debug, error, info, trace};
-use process_data::{GpuIdentifier, GpuUsageStats, Niceness, ProcessData};
+use process_data::{
+    pci_slot::PciSlot, GpuIdentifier, GpuUsageStats, Niceness, NpuUsageStats, ProcessData,
+};
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
@@ -36,18 +38,29 @@ static COMPANION_PROCESS: LazyLock<Mutex<(ChildStdin, ChildStdout)>> = LazyLock:
     let child = if *IS_FLATPAK {
         debug!("Spawning resources-processes in Flatpak mode ({proxy_path})");
         Command::new(FLATPAK_SPAWN)
-            .args(["--host", proxy_path.as_str()])
+            .args([
+                &format!(
+                    "--env=RUST_LOG={}",
+                    std::env::var("RUST_LOG=resources").unwrap_or("warn".into())
+                ),
+                "--host",
+                proxy_path.as_str(),
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap()
     } else {
         debug!("Spawning resources-processes in native mode ({proxy_path})");
         Command::new(proxy_path)
+            .arg(&format!(
+                "--env=RUST_LOG={}",
+                std::env::var("RUST_LOG=resources").unwrap_or("warn".into())
+            ))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap()
     };
@@ -70,6 +83,7 @@ pub struct Process {
     pub read_bytes_last: Option<u64>,
     pub write_bytes_last: Option<u64>,
     pub gpu_usage_stats_last: BTreeMap<GpuIdentifier, GpuUsageStats>,
+    pub npu_usage_stats_last: BTreeMap<PciSlot, NpuUsageStats>,
     pub display_name: String,
 }
 
@@ -172,6 +186,7 @@ impl Process {
             read_bytes_last,
             write_bytes_last,
             gpu_usage_stats_last: Default::default(),
+            npu_usage_stats_last: Default::default(),
             display_name,
         }
     }
@@ -473,6 +488,38 @@ impl Process {
     pub fn gpu_mem_usage(&self) -> u64 {
         self.data
             .gpu_usage_stats
+            .values()
+            .map(|stats| stats.mem)
+            .sum()
+    }
+
+    #[must_use]
+    pub fn npu_usage(&self) -> f32 {
+        let mut returned_npu_usage = 0.0;
+        for (npu, usage) in &self.data.npu_usage_stats {
+            if let Some(old_usage) = self.npu_usage_stats_last.get(npu) {
+                let this_npu_usage = if old_usage.usage == 0 {
+                    0.0
+                } else {
+                    ((usage.usage.saturating_sub(old_usage.usage) as f32)
+                        / (self.data.timestamp.saturating_sub(self.timestamp_last) as f32)
+                            .finite_or_default())
+                        / 1_000_000.0
+                };
+
+                if this_npu_usage > returned_npu_usage {
+                    returned_npu_usage = this_npu_usage;
+                }
+            }
+        }
+
+        returned_npu_usage
+    }
+
+    #[must_use]
+    pub fn npu_mem_usage(&self) -> u64 {
+        self.data
+            .npu_usage_stats
             .values()
             .map(|stats| stats.mem)
             .sum()

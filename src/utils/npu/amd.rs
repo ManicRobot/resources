@@ -1,7 +1,7 @@
 use anyhow::Result;
-use process_data::{pci_slot::PciSlot, unix_as_millis};
+use process_data::pci_slot::PciSlot;
 
-use std::{cell::Cell, path::PathBuf};
+use std::path::PathBuf;
 
 use crate::utils::pci::Device;
 
@@ -9,17 +9,15 @@ use super::NpuImpl;
 
 #[derive(Debug, Clone, Default)]
 
-pub struct IntelNpu {
+pub struct AmdNpu {
     pub device: Option<&'static Device>,
     pub pci_slot: PciSlot,
     pub driver: String,
     sysfs_path: PathBuf,
     first_hwmon_path: Option<PathBuf>,
-    last_busy_time_us: Cell<usize>,
-    last_busy_time_timestamp: Cell<u64>,
 }
 
-impl IntelNpu {
+impl AmdNpu {
     pub fn new(
         device: Option<&'static Device>,
         pci_slot: PciSlot,
@@ -33,13 +31,11 @@ impl IntelNpu {
             driver,
             sysfs_path,
             first_hwmon_path,
-            last_busy_time_us: Cell::default(),
-            last_busy_time_timestamp: Cell::default(),
         }
     }
 }
 
-impl NpuImpl for IntelNpu {
+impl NpuImpl for AmdNpu {
     fn device(&self) -> Option<&'static Device> {
         self.device
     }
@@ -65,21 +61,7 @@ impl NpuImpl for IntelNpu {
     }
 
     fn usage(&self) -> Result<f64> {
-        let last_timestamp = self.last_busy_time_timestamp.get();
-        let last_busy_time = self.last_busy_time_us.get();
-
-        let new_timestamp = unix_as_millis();
-        let new_busy_time = self
-            .read_device_int("npu_busy_time_us")
-            .map(|int| int as usize)?;
-
-        self.last_busy_time_timestamp.set(new_timestamp);
-        self.last_busy_time_us.set(new_busy_time);
-
-        let delta_timestamp = new_timestamp.saturating_sub(last_timestamp) as f64;
-        let delta_busy_time = new_busy_time.saturating_sub(last_busy_time) as f64;
-
-        Ok((delta_busy_time / delta_timestamp) / 1000.0)
+        self.drm_usage().map(|usage| usage as f64 / 100.0)
     }
 
     fn used_memory(&self) -> Result<usize> {

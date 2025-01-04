@@ -1,6 +1,8 @@
+mod amd;
 mod intel;
 mod other;
 
+use amd::AmdNpu;
 use anyhow::{bail, Context, Result};
 use log::{debug, info, trace};
 use process_data::pci_slot::PciSlot;
@@ -21,6 +23,7 @@ use self::{intel::IntelNpu, other::OtherNpu};
 
 use super::pci::Vendor;
 
+pub const VID_AMD: u16 = 4098;
 pub const VID_INTEL: u16 = 0x8086;
 
 #[derive(Debug)]
@@ -50,8 +53,8 @@ impl NpuData {
 
         let usage_fraction = npu.usage().ok();
 
-        let total_memory = npu.total_vram().ok();
-        let used_memory = npu.used_vram().ok();
+        let total_memory = npu.total_memory().ok();
+        let used_memory = npu.used_memory().ok();
 
         let clock_speed = npu.core_frequency().ok();
         let vram_speed = npu.memory_frequency().ok();
@@ -83,6 +86,7 @@ impl NpuData {
 
 #[derive(Debug, Clone)]
 pub enum Npu {
+    Amd(AmdNpu),
     Intel(IntelNpu),
     Other(OtherNpu),
 }
@@ -102,8 +106,8 @@ pub trait NpuImpl {
 
     fn name(&self) -> Result<String>;
     fn usage(&self) -> Result<f64>;
-    fn used_vram(&self) -> Result<usize>;
-    fn total_vram(&self) -> Result<usize>;
+    fn used_memory(&self) -> Result<usize>;
+    fn total_memory(&self) -> Result<usize>;
     fn temperature(&self) -> Result<f64>;
     fn power_usage(&self) -> Result<f64>;
     fn core_frequency(&self) -> Result<f64>;
@@ -151,14 +155,17 @@ pub trait NpuImpl {
     }
 
     fn drm_usage(&self) -> Result<isize> {
-        bail!("usage fallback not implemented")
+        // This is purely a guess for the future since no NPU driver has actually implemented this statistic
+        self.read_device_int("npu_busy_percent")
     }
 
-    fn drm_used_vram(&self) -> Result<isize> {
+    fn drm_used_memory(&self) -> Result<isize> {
+        // This is purely a guess for the future since no NPU driver has actually implemented this statistic
         self.read_device_int("mem_info_vram_used")
     }
 
-    fn drm_total_vram(&self) -> Result<isize> {
+    fn drm_total_memory(&self) -> Result<isize> {
+        // This is purely a guess for the future since no NPU driver has actually implemented this statistic
         self.read_device_int("mem_info_vram_total")
     }
 
@@ -268,6 +275,17 @@ impl Npu {
                 )),
                 "Intel",
             )
+        } else if vid == VID_AMD || driver == "amdxdna" {
+            (
+                Npu::Amd(AmdNpu::new(
+                    device,
+                    pci_slot,
+                    driver,
+                    path.to_path_buf(),
+                    hwmon_vec.first().cloned(),
+                )),
+                "AMD",
+            )
         } else {
             (
                 Npu::Other(OtherNpu::new(
@@ -294,6 +312,7 @@ impl Npu {
 
     pub fn get_vendor(&self) -> Result<&'static Vendor> {
         Ok(match self {
+            Npu::Amd(npu) => npu.device(),
             Npu::Intel(npu) => npu.device(),
             Npu::Other(npu) => npu.device(),
         }
@@ -303,6 +322,7 @@ impl Npu {
 
     pub fn pci_slot(&self) -> PciSlot {
         match self {
+            Npu::Amd(npu) => npu.pci_slot(),
             Npu::Intel(npu) => npu.pci_slot(),
             Npu::Other(npu) => npu.pci_slot(),
         }
@@ -310,6 +330,7 @@ impl Npu {
 
     pub fn driver(&self) -> String {
         match self {
+            Npu::Amd(npu) => npu.driver(),
             Npu::Intel(npu) => npu.driver(),
             Npu::Other(npu) => npu.driver(),
         }
@@ -317,6 +338,7 @@ impl Npu {
 
     pub fn name(&self) -> Result<String> {
         match self {
+            Npu::Amd(npu) => npu.name(),
             Npu::Intel(npu) => npu.name(),
             Npu::Other(npu) => npu.name(),
         }
@@ -324,27 +346,31 @@ impl Npu {
 
     pub fn usage(&self) -> Result<f64> {
         match self {
+            Npu::Amd(npu) => npu.usage(),
             Npu::Intel(npu) => npu.usage(),
             Npu::Other(npu) => npu.usage(),
         }
     }
 
-    pub fn used_vram(&self) -> Result<usize> {
+    pub fn used_memory(&self) -> Result<usize> {
         match self {
-            Npu::Intel(npu) => npu.used_vram(),
-            Npu::Other(npu) => npu.used_vram(),
+            Npu::Amd(npu) => npu.used_memory(),
+            Npu::Intel(npu) => npu.used_memory(),
+            Npu::Other(npu) => npu.used_memory(),
         }
     }
 
-    pub fn total_vram(&self) -> Result<usize> {
+    pub fn total_memory(&self) -> Result<usize> {
         match self {
-            Npu::Intel(npu) => npu.total_vram(),
-            Npu::Other(npu) => npu.total_vram(),
+            Npu::Amd(npu) => npu.total_memory(),
+            Npu::Intel(npu) => npu.total_memory(),
+            Npu::Other(npu) => npu.total_memory(),
         }
     }
 
     pub fn temperature(&self) -> Result<f64> {
         match self {
+            Npu::Amd(npu) => npu.temperature(),
             Npu::Intel(npu) => npu.temperature(),
             Npu::Other(npu) => npu.temperature(),
         }
@@ -352,6 +378,7 @@ impl Npu {
 
     pub fn power_usage(&self) -> Result<f64> {
         match self {
+            Npu::Amd(npu) => npu.power_usage(),
             Npu::Intel(npu) => npu.power_usage(),
             Npu::Other(npu) => npu.power_usage(),
         }
@@ -359,6 +386,7 @@ impl Npu {
 
     pub fn core_frequency(&self) -> Result<f64> {
         match self {
+            Npu::Amd(npu) => npu.core_frequency(),
             Npu::Intel(npu) => npu.core_frequency(),
             Npu::Other(npu) => npu.core_frequency(),
         }
@@ -366,6 +394,7 @@ impl Npu {
 
     pub fn memory_frequency(&self) -> Result<f64> {
         match self {
+            Npu::Amd(npu) => npu.memory_frequency(),
             Npu::Intel(npu) => npu.memory_frequency(),
             Npu::Other(npu) => npu.memory_frequency(),
         }
@@ -373,6 +402,7 @@ impl Npu {
 
     pub fn power_cap(&self) -> Result<f64> {
         match self {
+            Npu::Amd(npu) => npu.power_cap(),
             Npu::Intel(npu) => npu.power_cap(),
             Npu::Other(npu) => npu.power_cap(),
         }
@@ -380,6 +410,7 @@ impl Npu {
 
     pub fn power_cap_max(&self) -> Result<f64> {
         match self {
+            Npu::Amd(npu) => npu.power_cap(),
             Npu::Intel(npu) => npu.power_cap_max(),
             Npu::Other(npu) => npu.power_cap_max(),
         }

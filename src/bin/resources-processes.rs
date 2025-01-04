@@ -1,4 +1,5 @@
 use anyhow::Result;
+use log::{info, trace};
 use process_data::ProcessData;
 use ron::ser::PrettyConfig;
 use std::io::{Read, Write};
@@ -18,6 +19,11 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    // Initialize logger
+    pretty_env_logger::init();
+
+    info!("Starting resources-processes…");
+
     let args = Args::parse();
 
     if args.once {
@@ -29,12 +35,14 @@ fn main() -> Result<()> {
         let mut buffer = [0; 1];
 
         std::io::stdin().read_exact(&mut buffer)?;
+        trace!("Received character");
 
         output(args.ron)?;
     }
 }
 
 fn output(ron: bool) -> Result<()> {
+    trace!("Gathering process data…");
     let data = ProcessData::all_process_data()?;
 
     let encoded = if ron {
@@ -50,10 +58,13 @@ fn output(ron: bool) -> Result<()> {
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
 
+    trace!("Sending content length ({})…", encoded.len());
     handle.write_all(&len_byte_array)?;
 
+    trace!("Sending content…");
     handle.write_all(&encoded)?;
 
+    trace!("Flushing…");
     handle.flush()?;
     Ok(())
 }

@@ -64,12 +64,12 @@ impl NpuImpl for OtherNpu {
         self.drm_usage().map(|usage| usage as f64 / 100.0)
     }
 
-    fn used_vram(&self) -> Result<usize> {
-        self.drm_used_vram().map(|usage| usage as usize)
+    fn used_memory(&self) -> Result<usize> {
+        self.drm_used_memory().map(|usage| usage as usize)
     }
 
-    fn total_vram(&self) -> Result<usize> {
-        self.drm_total_vram().map(|usage| usage as usize)
+    fn total_memory(&self) -> Result<usize> {
+        self.drm_total_memory().map(|usage| usage as usize)
     }
 
     fn temperature(&self) -> Result<f64> {
